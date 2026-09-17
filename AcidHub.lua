@@ -7872,7 +7872,7 @@ do (function()
             grid.Visible=name~="Settings"; settings.Visible=name=="Settings"
             for key,control in pairs(tabsHere) do control.TextColor3=key==name and colors.accent or colors.text end
             status.Text=name=="Settings" and "Display preferences save with Config > Save settings. Weight Percentage: normal species weight = 100%." or
-                (name=="Pets" and "Click a pet to load one fuse slot. This does not start fusion." or "Your owned eggs, including eggs growing in your pen.")
+                (name=="Pets" and "Click a pet to load one fuse slot. This does not start fusion." or "Click a growing pen egg to use ONE Mutation Consumable (10% Boss chance). Each attempt spends an item.")
             clearCards()
         end)
     end
@@ -8098,6 +8098,77 @@ do (function()
         busy=false; dirty=true
         if not ok and not closed then status.Text=tostring(err) end
     end
+    local mutationPending=false
+    local mutationLastUse=-math.huge
+    local function applyMutation(uid)
+        if busy or mutationPending or os.clock()-mutationLastUse<1 then return end
+        local reader=require(storage.Client.EggState)
+        local tool,egg,beforeUses,beforeMutation
+        local ready,reason=pcall(function()
+            assert(not closed,"Hub closed")
+            for _,key in ipairs({"Auto Hatch","Auto Sell Eggs"}) do
+                assert(not settingsBindings[key] or not settingsBindings[key].get(),"Turn OFF "..key.." before using a mutation item")
+            end
+            assert(not automationFlow.selling,"Wait for the current sale to finish")
+            local eggs=reader.ReadOwnerEggs(player.UserId)
+            egg=assert(type(eggs)=="table" and eggs[uid],"Egg is no longer in your inventory")
+            assert(egg.Placement~=nil,"Choose an egg placed in your pen")
+            assert(not reader.IsReadyToHatch(uid),"Choose a growing egg; this egg is ready to hatch")
+            beforeMutation=mutationNames(egg.Mutations,egg.BaseMutation)
+            assert(not beforeMutation:lower():find("boss",1,true),"This egg already has Boss mutation")
+            beforeUses=assert(readMutationCount(),"Item count unavailable")
+            assert(beforeUses>0,"No Mutation Consumables remaining")
+            for _,container in ipairs({player.Backpack,player.Character or player.Backpack}) do
+                for _,candidate in ipairs(container:GetChildren()) do
+                    if candidate:IsA("Tool") and candidate:GetAttribute("ItemType")=="MutationConsumable" and (tonumber(candidate:GetAttribute("Uses")) or 0)>0 then tool=candidate; break end
+                end
+                if tool then break end
+            end
+            assert(tool,"Mutation Consumable tool unavailable")
+        end)
+        if not ready then status.Text=tostring(reason); return end
+        local remote=storage:FindFirstChild("RF/BossMastery/AskUseMutationConsumable",true)
+        if not remote or not remote:IsA("RemoteFunction") then status.Text="Mutation request unavailable"; return end
+        busy=true; mutationPending=true; mutationLastUse=os.clock()
+        status.Text="Applying ONE Mutation Consumable to egg "..uid.."..."
+        local responded=false
+        task.delay(15,function()
+            if not responded and not closed then status.Text="Mutation response pending. Further uses blocked; no retry sent." end
+        end)
+        local ok,err=pcall(function()
+            local character=assert(player.Character,"Character unavailable")
+            local humanoid=assert(movementHumanoid(character),"Humanoid unavailable")
+            assert(humanoid.Health>0,"Wait for respawn")
+            if tool.Parent~=character then humanoid:EquipTool(tool) end
+            assert(tool.Parent==character,"Could not equip Mutation Consumable")
+            -- Captured normal use: one string argument. Do not loop or retry.
+            local result=table.pack(remote:InvokeServer(uid))
+            responded=true
+            local deadline=os.clock()+5
+            local afterMutation,afterUses=beforeMutation,beforeUses
+            repeat
+                task.wait(0.2)
+                local current=reader.ReadOwnerEggs(player.UserId)
+                local currentEgg=current and current[uid]
+                afterUses=readMutationCount()
+                if currentEgg then afterMutation=mutationNames(currentEgg.Mutations,currentEgg.BaseMutation) end
+                if afterMutation~=beforeMutation then break end
+            until closed or os.clock()>=deadline
+            if not closed then
+                local countText=afterUses and tostring(afterUses) or "unavailable"
+                mutationCount.Text="Mutation Consumables: "..countText
+                if afterMutation:lower():find("boss",1,true) then
+                    status.Text="Boss mutation observed! Remaining items: "..countText
+                elseif afterUses and afterUses<beforeUses then
+                    status.Text="Item consumed; Boss mutation not observed. Remaining: "..countText..". No retry sent."
+                else
+                    status.Text="Use unconfirmed. Server result: "..tostring(result[1]).." | "..tostring(result[2])..". No retry sent."
+                end
+            end
+        end)
+        responded=true; mutationPending=false; busy=false; dirty=true; mutationLastUse=os.clock()
+        if not ok and not closed then status.Text="Mutation use stopped: "..tostring(err)..". No retry sent." end
+    end
     local function readInventory()
         local save=assert(require(storage.Shared.Save).Get(),"Save unavailable")
         local items=require(storage.Shared.Util.AssetItems)
@@ -8189,6 +8260,8 @@ do (function()
             cards[#cards+1]={frame=card,icon=icon,entry=entry,stroke=stroke}
             if activeTab=="Pets" and not entry.error then
                 cardConnections[#cardConnections+1]=card.Activated:Connect(function() loadPet(entry.uid) end)
+            elseif activeTab=="Eggs" and not entry.error then
+                cardConnections[#cardConnections+1]=card.Activated:Connect(function() applyMutation(entry.uid) end)
             end
         end
         if #entries==0 then status.Text="No "..activeTab:lower().." in your inventory." end
@@ -8482,6 +8555,9 @@ do (function()
         local aimIndex,lookAt,checkAt=nil,0,0
         local crystalTarget,crystalGoal=nil,nil
         local crystalSide=0
+        local crystalWatch={target=nil,best=math.huge,at=0,reported=0}
+        local lineJumpEnabled=false
+        local lineParts,lineRefresh,lineLastJump={},0,0
         local attackTarget=nil
         local arrivalPart=nil
         local meteorMemory={}
@@ -8778,6 +8854,7 @@ do (function()
         local useArenaSearch=false
         local function navigate(destination,character,h,root,escaping)
             if not enabled or player:GetAttribute("InBossArena")~=true or player.Character~=character then halt(); return "cancelled" end
+            if lineJumpEnabled and os.clock()-lineLastJump<1 and h.FloorMaterial==Enum.Material.Air then return "jumping" end
             if routePosition and (root.Position-routePosition).Magnitude>512 then invalidateArenaRoute(); return "cancelled after relocation" end
             routePosition=root.Position
             if routeGoal and (routeGoal-destination).Magnitude>8 then halt() end
@@ -9027,7 +9104,7 @@ do (function()
                 say("Waiting for boss spawn to finish; crystals are not active yet")
                 return
             end
-            if dodgeMeteors(character,h,root) then attackTarget=nil; return end
+            if dodgeMeteors(character,h,root) then attackTarget=nil; crystalWatch.at=os.clock(); crystalWatch.best=math.huge; return end
             if phase=="crystals" then
                 local target
                 if crystalTarget and crystalTarget:IsDescendantOf(model) and (tonumber(crystalTarget:GetAttribute("Health")) or 0)>0 and (not blacklist[crystalTarget] or os.clock()>blacklist[crystalTarget]) then target=crystalTarget end
@@ -9049,9 +9126,19 @@ do (function()
                     halt()
                 end
                 destination=crystalGoal
+                if crystalWatch.target~=target then
+                    crystalWatch={target=target,best=distance,at=os.clock(),reported=0}
+                elseif distance<crystalWatch.best-1 then
+                    crystalWatch.best=distance; crystalWatch.at=os.clock()
+                end
+                if distance>8 and os.clock()-crystalWatch.at>4 then
+                    note(string.format("BOSS APPROACH | Crystal %s | edge %.1f | goal %.1f | no approach progress; replanning",target.Parent.Name,distance,(destination-root.Position).Magnitude))
+                    crystalSide=crystalSide+1; crystalGoal=nil; useArenaSearch=true; halt()
+                    crystalWatch.best=math.huge; crystalWatch.at=os.clock(); return
+                end
                 arrivalPart=target
                 say("Crystals: "..#living.." alive | target "..target.Parent.Name.." | health "..tostring(target:GetAttribute("Health")))
-                if attackHold(distance,attackTarget==target,12,14) then
+                if attackHold(distance,attackTarget==target,8,10) then
                     attackTarget=target; halt(); swing(character,h,root)
                     local hits=tonumber(player:GetAttribute("BossCrystalHits")) or 0
                     if hits~=lastHitCount then lastHitCount=hits; lastHitProgress=os.clock() end
@@ -9060,8 +9147,11 @@ do (function()
                 else
                     attackTarget=nil; lastHitProgress=0
                     local result=navigate(destination,character,h,root,false)
+                    if result=="arrived" and distance>8 and (destination-root.Position).Magnitude<4 then
+                        result="approach endpoint reached outside attack range (edge "..string.format("%.1f",distance)..")"
+                    end
                     if result=="route rejected; switching to arena search" then return end
-                    if result~="moving" and result~="waiting" and result~="arrived" then
+                    if result~="moving" and result~="waiting" and result~="arrived" and result~="jumping" then
                         crystalSide=crystalSide+1; crystalGoal=nil; halt()
                         if crystalSide>=8 then blacklist[target]=os.clock()+3; crystalSide=0 end
                         note("BOSS PATH | Crystal "..target.Parent.Name.." | "..result.." | trying another approach side")
@@ -9078,11 +9168,59 @@ do (function()
                 attackTarget=nil; halt(); say("Waiting for exposed hand / boss spawn")
             end
         end
+        switch(debugPage,"Boss Line Jump Test",false,function(value)
+            lineJumpEnabled=value; lineParts={}; lineRefresh=0
+            note("BOSS LINE TEST | "..(value and "ON: experimental red-bar detection" or "OFF"))
+        end,"Experimental: during Auto Fight, jump over nearby thin red horizontal parts. Names and jumps are logged for verification. Blackholes and comet handling are unchanged.")
+        local function testLineJump(character,h,root)
+            if not lineJumpEnabled or h.FloorMaterial==Enum.Material.Air or os.clock()-lineLastJump<0.85 then return end
+            local now=os.clock()
+            if now-lineRefresh>0.25 then
+                lineRefresh=now; lineParts={}
+                local model=arena()
+                if model then for _,part in ipairs(model:GetDescendants()) do
+                    if part:IsA("BasePart") and part.Transparency<0.8 then
+                        local size=part.Size; local long=math.max(size.X,size.Z); local short=math.min(size.X,size.Z)
+                        local c=part.Color; local name=part:GetFullName():lower()
+                        if math.abs(part.CFrame.UpVector.Y)>0.95 and long>=30 and long/math.max(short,0.1)>=8 and size.Y<=8 and c.R>0.7 and c.G<0.35 and c.B<0.4
+                            and not name:find("meteor",1,true) and not name:find("blackhole",1,true) then
+                            lineParts[#lineParts+1]=part
+                        end
+                    end
+                end end
+            end
+            local velocity=root.AssemblyLinearVelocity
+            local predicted=root.Position+Vector3.new(velocity.X,0,velocity.Z)*0.18
+            for _,part in ipairs(lineParts) do
+                if part.Parent then
+                    local a=part.CFrame:PointToObjectSpace(root.Position)
+                    local b=part.CFrame:PointToObjectSpace(predicted)
+                    local half=part.Size/2
+                    local feet=root.Position.Y-h.HipHeight-root.Size.Y/2
+                    local top=part.Position.Y+half.Y
+                    local jumpHeight=h.UseJumpPower and h.JumpPower*h.JumpPower/(2*workspace.Gravity) or h.JumpHeight
+                    if top>=feet-1 and top-feet<jumpHeight-1 then
+                        for n=0,4 do
+                            local point=a:Lerp(b,n/4)
+                            if math.abs(point.X)<=half.X+4 and math.abs(point.Z)<=half.Z+4 then
+                                local landing=root.Position+Vector3.new(velocity.X,0,velocity.Z)*0.35
+                                if segmentSafe(root.Position,landing,character,false) then
+                                    lineLastJump=now; crystalWatch.at=now; h.Jump=true
+                                    note("BOSS LINE TEST | Jump | "..part:GetFullName().." | size="..tostring(part.Size))
+                                end
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+        end
         -- Brake at frame rate so a fast character does not cross the arrival band between logic ticks.
         connect(game:GetService("RunService").Heartbeat,function()
             if not enabled or player:GetAttribute("InBossArena")~=true then return end
             local character,h,root=characterParts()
             if character~=owner or not h or not root or h.Health<=0 then return end
+            testLineJump(character,h,root)
             if dodgeGoal then
                 if (root.Position-dodgeGoal).Magnitude<=7 and hazardCost(root.Position)==0 then halt() end
             elseif arrivalPart and arrivalPart.Parent and hazardCost(root.Position)==0 then
@@ -9091,7 +9229,7 @@ do (function()
                     if not arrivalPart:FindFirstChild("Health") then return end
                     distance=(arrivalPart.TransformedWorldCFrame.Position-root.Position).Magnitude
                 else local _,d=approachPoint(arrivalPart,root.Position); distance=d end
-                if distance<=12 then halt() end
+                if distance<=(arrivalPart:IsA("Bone") and 12 or 8) then halt() end
             end
         end)
         task.spawn(function()
@@ -9180,6 +9318,140 @@ do (function()
             end
             task.wait(1)
         end
+    end)
+end)() end
+
+-- Short outgoing capture around a manual boss portal exit. Sends no requests.
+do (function()
+    local function r(height,order) local frame=row(debugPage,height); frame.LayoutOrder=order; return frame end
+    local start=button("Start Boss Exit Capture",UDim2.new(),UDim2.new(1,0,1,0),r(38,-1030))
+    local stop=button("Stop Boss Exit Capture",UDim2.new(),UDim2.new(1,0,1,0),r(38,-1029))
+    local copy=button("Copy Boss Exit Capture",UDim2.new(),UDim2.new(1,0,1,0),r(38,-1028))
+    local display=label("Stand near the boss exit. Turn Auto Return From Boss and No Traps OFF, then Start and walk through manually. Requires outgoing-call hooks.",UDim2.fromOffset(10,6),UDim2.new(1,-20,1,-12),r(94,-1027),true)
+    display.TextSize=14
+    local active,started,count=false,0,0
+    local lines,report={},""
+    local observer,recordCallback
+    local lastInside,exitAt=nil,nil
+    local limited=false
+    local function encode(value,depth,seen)
+        depth=depth or 0; seen=seen or {}
+        if typeof(value)=="Instance" then return value.ClassName..":"..value:GetFullName() end
+        if type(value)=="string" then return string.format("%q",value:sub(1,512)) end
+        if type(value)~="table" then return tostring(value) end
+        if seen[value] then return "<cycle>" end
+        if depth>=3 then return "<depth limit>" end
+        seen[value]=true; local parts,n={},0
+        for k,v in pairs(value) do
+            n=n+1; if n>16 then parts[#parts+1]="<truncated>"; break end
+            parts[#parts+1]="["..encode(k,depth+1,seen).."]="..encode(v,depth+1,seen)
+        end
+        seen[value]=nil; return "{"..table.concat(parts,", ").."}"
+    end
+    local function emit(message)
+        lines[#lines+1]=string.format("[%.3fs] %s",os.clock()-started,message)
+    end
+    local function state()
+        local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        return "InBossArena="..tostring(player:GetAttribute("InBossArena")).." | position="..(root and tostring(root.Position) or "unavailable")
+    end
+    local function finish(reason)
+        if not active then return end
+        active=false
+        if observer and observer.record==recordCallback then observer.record=nil end
+        emit("STOP | "..reason.." | calls="..count.." | call limit reached="..tostring(limited))
+        emit("FINAL STATE | "..state())
+        lines[#lines+1]="Coverage: colon FireServer/InvokeServer through __namecall only; no responses intercepted. Direct calls may bypass interception. Absence of a call does not prove server-side touch handling. Unrelated remote arguments omitted."
+        report=table.concat(lines,"\n")
+        local saved=type(writefile)=="function" and pcall(writefile,"AcidHub_Boss_Exit_Capture.txt",report)
+        display.Text="Captured "..count.." outgoing calls. "..(saved and "Saved AcidHub_Boss_Exit_Capture.txt. Send this file." or "Use Copy Boss Exit Capture.")
+    end
+    connect(start.Activated,function()
+        if active then display.Text="ARMED: walk through the return portal manually."; return end
+        if player:GetAttribute("InBossArena")~=true then display.Text="Enter the boss arena and stand near its exit first."; return end
+        for _,key in ipairs({"Auto Return From Boss","No Traps"}) do
+            if settingsBindings[key] and settingsBindings[key].get() then display.Text="Turn OFF "..key.." before the manual exit capture."; return end
+        end
+        if type(hookmetamethod)~="function" or type(getnamecallmethod)~="function" or type(getgenv)~="function" then
+            display.Text="UNSUPPORTED: outgoing-call hooks unavailable. Use an executor with the required hooks."; return
+        end
+        local ok,err=pcall(function()
+            local env=getgenv(); local key="AcidHubBossExitObserverV1"
+            observer=env[key]
+            if not observer then
+                local capture={}; local previous
+                -- EXIT HOOK BEGIN
+                local function intercept(self,...)
+                    local method=getnamecallmethod()
+                    if capture.record and (method=="FireServer" or method=="InvokeServer") then
+                        pcall(capture.record,self,method,table.pack(...))
+                    end
+                    return previous(self,...)
+                end
+                -- EXIT HOOK END
+                previous=hookmetamethod(game,"__namecall",type(newcclosure)=="function" and newcclosure(intercept) or intercept)
+                assert(type(previous)=="function","Original hook unavailable")
+                env[key]=capture; observer=capture
+            end
+            assert(type(observer)=="table","Observer unavailable")
+            lines={"AcidHub Boss Exit Capture",os.date("!%Y-%m-%d %H:%M:%S UTC"),"No requests sent, changed, blocked or retried by recorder."}
+            report=""; started=os.clock(); count=0; limited=false; exitAt=nil; lastInside=true; active=true
+            emit("START | "..state())
+            recordCallback=function(remote,method,args)
+                if not active or closed then return end
+                if count>=300 then limited=true; return end
+                count=count+1
+                local path=remote:GetFullName(); local lower=path:lower()
+                local relevant=false
+                for _,word in ipairs({"boss","arena","homestead","teleport","lobby","leave","return","exit"}) do
+                    if lower:find(word,1,true) then relevant=true; break end
+                end
+                local entry=method.." | "..remote.ClassName.." | "..path.." | argument count="..args.n
+                if relevant then
+                    for i=1,args.n do entry=entry.."\n  ARG "..i.." | "..typeof(args[i]).." | "..encode(args[i]) end
+                elseif args.n>0 then entry=entry.." | unrelated arguments omitted" end
+                emit(entry)
+            end
+            observer.record=recordCallback
+        end)
+        if not ok then
+            active=false
+            if observer and observer.record==recordCallback then observer.record=nil end
+            display.Text="Capture unavailable: "..tostring(err); return
+        end
+        display.Text="ARMED: walk through the exit now. Stops 3 seconds after leaving, or after 120 seconds. Hook installation does not guarantee every outgoing call is visible."
+    end)
+    connect(stop.Activated,function() finish("Stopped by user") end)
+    connect(copy.Activated,function()
+        if active then finish("Stopped to copy") end
+        if report=="" then display.Text="No exit report yet."; return end
+        local ok=type(setclipboard)=="function" and pcall(setclipboard,report)
+        display.Text=ok and "Boss exit capture copied." or "Clipboard unavailable; use the saved file."
+    end)
+    connect(player:GetAttributeChangedSignal("InBossArena"),function()
+        if active then
+            local inside=player:GetAttribute("InBossArena")==true
+            emit("ARENA STATE CHANGED | "..state()); lastInside=inside
+            if not inside then exitAt=exitAt or os.clock() end
+        end
+    end)
+    task.spawn(function()
+        while not closed do
+            if active then
+                local inside=player:GetAttribute("InBossArena")==true
+                if inside~=lastInside then emit("ARENA STATE | "..state()); lastInside=inside end
+                if not inside then exitAt=exitAt or os.clock() end
+                if limited then finish("300-call limit")
+                elseif exitAt and os.clock()-exitAt>=3 then finish("Lobby return observed")
+                elseif os.clock()-started>=120 then finish("120-second limit") end
+            end
+            task.wait(0.2)
+        end
+    end)
+    table.insert(cleanupActions,function()
+        if active then finish("Hub closed") end
+        if observer and observer.record==recordCallback then observer.record=nil end
+        -- Retain an inactive pass-through to preserve hooks installed by other scripts.
     end)
 end)() end
 
