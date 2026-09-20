@@ -234,8 +234,7 @@ do
             local storage=game:GetService("ReplicatedStorage")
             local shared=storage:FindFirstChild("Shared")
             assert(shared,"Shared modules not loaded")
-            -- Observe confirmed server state messages. The Request operation signature
-            -- is not known yet, so no speculative InvokeServer calls are made.
+            -- Observe server state; the manual vault buttons below use captured Request operations.
             local packages=storage:FindFirstChild("Packages")
             local networking=packages and packages:FindFirstChild("Networking")
             local stateEvent=networking and networking:FindFirstChild("RE/Scramble/State")
@@ -884,8 +883,9 @@ do
     local scanning = false
     local rewardCapture=button("Start Vault Reward Capture",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
     rewardCapture.LayoutOrder=0
-    local capturing,captureClosed,hookInstalled=false,false,false
+    local capturing,captureClosed=false,false
     local captureLines,captureConnection,captureGeneration={},nil,0
+    local captureClaimButton,captureClaimConnection
     local capturePending={}
     local function captureValue(value,depth,seen)
         if type(value)=="string" then return string.format("%q",value) end
@@ -914,61 +914,52 @@ do
         flushCapture()
         capturing=false; captureGeneration=captureGeneration+1
         if captureConnection then captureConnection:Disconnect(); captureConnection=nil end
+        if captureClaimConnection then captureClaimConnection:Disconnect(); captureClaimConnection=nil end
+        captureClaimButton=nil
         rewardCapture.Text="Start Vault Reward Capture"
     end
     connect(rewardCapture.Activated,function()
         if capturing then stopCapture(); status.Text="Capture stopped. Results are shown below and saved when file writing is available."; return end
-        if type(hookmetamethod)~="function" or type(getnamecallmethod)~="function" then
-            status.Text="This executor cannot capture outgoing requests (hookmetamethod/getnamecallmethod unavailable). Use Scan Vault Reward UI instead."
-            return
-        end
         local packages=game:GetService("ReplicatedStorage"):FindFirstChild("Packages")
         local networking=packages and packages:FindFirstChild("Networking")
-        local request=networking and networking:FindFirstChild("RF/Scramble/Request")
-        local collect=networking and networking:FindFirstChild("RE/Scramble/Collect")
         local state=networking and networking:FindFirstChild("RE/Scramble/State")
-        if not request or not state then status.Text="Scramble remotes are not loaded yet."; return end
-        if not hookInstalled then
-            local previous
-            local function observe(remote,...)
-                if capturing and not captureClosed and (remote==request or remote==collect) then
-                    local method=getnamecallmethod()
-                    if method=="InvokeServer" or method=="FireServer" then
-                        -- No engine calls, formatting, UI updates or file writes inside __namecall.
-                        -- Nested namecalls can replace the method before previous forwards it.
-                        if #capturePending<80 then
-                            capturePending[#capturePending+1]={
-                                name="OUT "..(remote==request and "RF/Scramble/Request" or "RE/Scramble/Collect").." "..method,
-                                args=table.pack(...),
-                            }
-                        end
-                    end
-                end
-                return previous(remote,...)
-            end
-            local ok,err=pcall(function()
-                previous=hookmetamethod(game,"__namecall",type(newcclosure)=="function" and newcclosure(observe) or observe)
-            end)
-            if not ok then status.Text="Request capture unavailable: "..tostring(err); return end
-            hookInstalled=true
-        end
-        captureLines={"AcidHub Tests - Manual vault reward capture (Scramble Request/Collect and State only)"}
+        if not state then status.Text="Scramble state event is not loaded yet."; return end
+        captureLines={"AcidHub Tests - Passive vault reward capture (UI clicks and server State; no outgoing interception)"}
         capturePending={}
         capturing=true; captureGeneration=captureGeneration+1
         local generation=captureGeneration
         appendCapture("START",{})
         captureConnection=state.OnClientEvent:Connect(function(...)
-            -- Flush the outgoing request first so the report keeps request/response order.
-            flushCapture(); pcall(appendCapture,"IN State",table.pack(...))
+            if capturing and not captureClosed and captureGeneration==generation and #capturePending<80 then
+                capturePending[#capturePending+1]={name="IN State",args=table.pack(...)}
+            end
         end)
+        local function bindClaim()
+            -- Four exact lookups, only during this manual capture; no broad UI traversal.
+            local vault=playerGui:FindFirstChild("StolenVaultEventUI")
+            local main=vault and vault:FindFirstChild("StolenVaultEventUIMain")
+            local content=main and main:FindFirstChild("ContentFrame")
+            local claim=content and content:FindFirstChild("Claim")
+            if claim==captureClaimButton then return end
+            if captureClaimConnection then captureClaimConnection:Disconnect(); captureClaimConnection=nil end
+            captureClaimButton=claim
+            if claim and claim:IsA("GuiButton") then
+                captureClaimConnection=claim.Activated:Connect(function()
+                    if capturing and not captureClosed and captureGeneration==generation and #capturePending<80 then
+                        capturePending[#capturePending+1]={name="UI Claim activated (not proof of success)",args={}}
+                    end
+                end)
+            end
+        end
         local function drain()
             if captureClosed or not capturing or captureGeneration~=generation then return end
             flushCapture()
-            task.delay(0.1,drain)
+            pcall(bindClaim)
+            task.delay(0.25,drain)
         end
-        task.delay(0.1,drain)
+        drain()
         rewardCapture.Text="Stop Vault Reward Capture"
-        status.Text="Capturing for 60 seconds. Click the vault reward once manually, then stop capture."
+        status.Text="Passive capture for 60 seconds. Open the vault and claim normally, then stop and copy."
         task.delay(60,function()
             if not captureClosed and capturing and captureGeneration==generation then
                 stopCapture(); status.Text="Vault capture finished. Results saved when file writing is available."
@@ -977,7 +968,6 @@ do
     end)
     table.insert(cleanupActions,function()
         stopCapture(); captureClosed=true
-        -- Leave the inert forwarding hook in the chain; restoring it could remove another script's hook.
     end)
     local copyRewardCapture=button("Copy Vault Reward Capture",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
     copyRewardCapture.LayoutOrder=0
@@ -1005,6 +995,46 @@ do
         output.SelectionStart=1
         status.Text="Clipboard unavailable. Report selected below: press Ctrl+C to copy."
     end)
+    -- VAULT REQUEST BUTTONS BEGIN
+    local openVault=button("Open Vault UI",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
+    local claimVault=button("Claim Vault Rewards",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
+    openVault.LayoutOrder=0; claimVault.LayoutOrder=0
+    local vaultRequestStatus=label("Manual vault calls: open the UI or claim your completed parts.",UDim2.new(),UDim2.new(1,-6,0,72),testsPage,true)
+    vaultRequestStatus.LayoutOrder=0; vaultRequestStatus.TextSize=14
+    local vaultRequestBusy,vaultRequestClosed=false,false
+    local vaultRequestGeneration=0
+    local function requestVault(operation)
+        if vaultRequestClosed or vaultRequestBusy then return end
+        local packages=game:GetService("ReplicatedStorage"):FindFirstChild("Packages")
+        local networking=packages and packages:FindFirstChild("Networking")
+        local request=networking and networking:FindFirstChild("RF/Scramble/Request")
+        if not request or not request:IsA("RemoteFunction") then
+            vaultRequestStatus.Text="Vault request remote is not loaded yet. Try again after the game loads."
+            return
+        end
+        vaultRequestBusy=true; vaultRequestGeneration=vaultRequestGeneration+1
+        local generation=vaultRequestGeneration
+        vaultRequestStatus.Text=(operation=="Discover" and "Opening vault UI" or "Requesting vault reward").." — waiting for server..."
+        task.delay(10,function()
+            if not vaultRequestClosed and vaultRequestBusy and generation==vaultRequestGeneration then
+                vaultRequestStatus.Text="Still waiting for the server. Repeated clicks are blocked until this request returns."
+            end
+        end)
+        -- Exact captured argument shape: operation followed by two explicit nil arguments.
+        local ok,result=pcall(function() return table.pack(request:InvokeServer(operation,nil,nil)) end)
+        vaultRequestBusy=false
+        if vaultRequestClosed then return end
+        if not ok then
+            vaultRequestStatus.Text="Vault request error: "..tostring(result)
+            return
+        end
+        local response=captureValue(result,0,{})
+        vaultRequestStatus.Text="Server returned: "..response:sub(1,240).."\nCheck the vault UI/reward to confirm the result."
+    end
+    connect(openVault.Activated,function() requestVault("Discover") end)
+    connect(claimVault.Activated,function() requestVault("Vault") end)
+    table.insert(cleanupActions,function() vaultRequestClosed=true end)
+    -- VAULT REQUEST BUTTONS END
     local rewardScan=button("Scan Vault Reward UI",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
     rewardScan.LayoutOrder=0
     connect(rewardScan.Activated,function()
