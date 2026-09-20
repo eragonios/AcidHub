@@ -886,6 +886,7 @@ do
     rewardCapture.LayoutOrder=0
     local capturing,captureClosed,hookInstalled=false,false,false
     local captureLines,captureConnection,captureGeneration={},nil,0
+    local capturePending={}
     local function captureValue(value,depth,seen)
         if type(value)=="string" then return string.format("%q",value) end
         if type(value)~="table" then return tostring(value) end
@@ -904,7 +905,13 @@ do
         output.Text=table.concat(captureLines,"\n")
         if type(writefile)=="function" then pcall(writefile,"AcidHubTests_VaultRewardCapture.txt",output.Text) end
     end
+    local function flushCapture()
+        local pending=capturePending
+        capturePending={}
+        for _,entry in ipairs(pending) do pcall(appendCapture,entry.name,entry.args) end
+    end
     local function stopCapture()
+        flushCapture()
         capturing=false; captureGeneration=captureGeneration+1
         if captureConnection then captureConnection:Disconnect(); captureConnection=nil end
         rewardCapture.Text="Start Vault Reward Capture"
@@ -927,7 +934,14 @@ do
                 if capturing and not captureClosed and (remote==request or remote==collect) then
                     local method=getnamecallmethod()
                     if method=="InvokeServer" or method=="FireServer" then
-                        pcall(appendCapture,"OUT "..remote.Name.." "..method,table.pack(...))
+                        -- No engine calls, formatting, UI updates or file writes inside __namecall.
+                        -- Nested namecalls can replace the method before previous forwards it.
+                        if #capturePending<80 then
+                            capturePending[#capturePending+1]={
+                                name="OUT "..(remote==request and "RF/Scramble/Request" or "RE/Scramble/Collect").." "..method,
+                                args=table.pack(...),
+                            }
+                        end
                     end
                 end
                 return previous(remote,...)
@@ -939,10 +953,20 @@ do
             hookInstalled=true
         end
         captureLines={"AcidHub Tests - Manual vault reward capture (Scramble Request/Collect and State only)"}
+        capturePending={}
         capturing=true; captureGeneration=captureGeneration+1
         local generation=captureGeneration
         appendCapture("START",{})
-        captureConnection=state.OnClientEvent:Connect(function(...) pcall(appendCapture,"IN State",table.pack(...)) end)
+        captureConnection=state.OnClientEvent:Connect(function(...)
+            -- Flush the outgoing request first so the report keeps request/response order.
+            flushCapture(); pcall(appendCapture,"IN State",table.pack(...))
+        end)
+        local function drain()
+            if captureClosed or not capturing or captureGeneration~=generation then return end
+            flushCapture()
+            task.delay(0.1,drain)
+        end
+        task.delay(0.1,drain)
         rewardCapture.Text="Stop Vault Reward Capture"
         status.Text="Capturing for 60 seconds. Click the vault reward once manually, then stop capture."
         task.delay(60,function()
@@ -952,12 +976,13 @@ do
         end)
     end)
     table.insert(cleanupActions,function()
-        captureClosed=true; stopCapture()
+        stopCapture(); captureClosed=true
         -- Leave the inert forwarding hook in the chain; restoring it could remove another script's hook.
     end)
     local copyRewardCapture=button("Copy Vault Reward Capture",UDim2.new(),UDim2.new(1,-6,0,36),testsPage)
     copyRewardCapture.LayoutOrder=0
     connect(copyRewardCapture.Activated,function()
+        flushCapture()
         if #captureLines==0 then
             status.Text="No vault reward capture yet. Start capture, claim manually, then stop and copy."
             return
