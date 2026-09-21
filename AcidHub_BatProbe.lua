@@ -1,5 +1,6 @@
 -- Read-only bat stats inspection and passive tool activation capture with a local UI.
--- No simulated input, movement, callback invocation, require, remotes, or hooks.
+-- Loads only the two confirmed configuration modules to inspect their exports.
+-- No simulated input, movement, exported-function calls, remote calls, or hooks.
 local players=game:GetService("Players")
 local player=players.LocalPlayer
 local gui=Instance.new("ScreenGui")
@@ -65,7 +66,7 @@ local function stop(reason)
 end
 local function start()
     if destroyed or (session and session.active) then return end
-    local s={active=true,output={"AcidHub bat inspection v2"},connections={},bytes=0,started=os.clock()}
+    local s={active=true,output={"AcidHub bat inspection v3"},connections={},bytes=0,started=os.clock()}
     session=s
     status.Text="Reading owned bat stats and weapon scripts. No weapon changes."
     reportBox.Text="Scan running…"
@@ -178,6 +179,41 @@ local storage=game:GetService("ReplicatedStorage")
 local shared=storage:FindFirstChild("Shared")
 local modules=shared and shared:FindFirstChild("Modules")
 local controller=modules and modules:FindFirstChild("BatController")
+local function inspectConfig(module)
+    if not module or not module:IsA("ModuleScript") then add("Configuration module unavailable");return end
+    add("CONFIG EXPORT "..path(module))
+    -- require returns the game's cached export when already loaded; otherwise
+    -- it executes this configuration module's initialization. Never call exports.
+    local ok,value=pcall(require,module)
+    if not s.active then return end
+    if not ok then add("Config export unavailable: "..tostring(value));return end
+    local visited={}
+    local entries=0
+    local function dump(item,prefix,depth)
+        if not s.active or entries>=400 then return end
+        if type(item)~="table" then
+            entries+=1
+            add(prefix.." = "..(type(item)=="function" and "<function; not called>" or tostring(item)))
+            return
+        end
+        if visited[item] then add(prefix.." = <shared or cyclic table>");return end
+        if depth>6 then add(prefix.." = <depth limit>");return end
+        visited[item]=true
+        add(prefix.." = table")
+        for key,child in next,item do
+            if entries>=400 or not s.active then break end
+            dump(child,prefix.."."..tostring(key),depth+1)
+        end
+    end
+    dump(value,"Config",0)
+    if entries>=400 then add("Config entry limit reached") end
+    save(s)
+end
+inspectConfig(controller and controller:FindFirstChild("Config"))
+local data=storage:FindFirstChild("Data")
+local gears=data and data:FindFirstChild("Gears")
+local configs=gears and gears:FindFirstChild("Configs")
+inspectConfig(configs and configs:FindFirstChild("Bat"))
 if controller then
     describe(controller)
     if controller:IsA("ModuleScript") then inspectScript(controller) end
